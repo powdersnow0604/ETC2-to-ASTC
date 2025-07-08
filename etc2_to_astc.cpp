@@ -6,6 +6,10 @@
 #include <astcenc/astcenc_internal_entry.h>
 #include <astcenc/astcenc.h>
 #include <fstream>
+#include <stb_image.h>
+#include <omp.h>
+
+static uint8_t table59T58H[8] = { 3,6,11,16,23,32,41,64 };
 
 #if defined __SSE4_1__ || defined __AVX2__ || defined _MSC_VER
 #ifdef _MSC_VER
@@ -23,15 +27,75 @@
 #define _bswap64(x) __builtin_bswap64(x)
 #endif
 
+static astcenc_image *alloc_image(
+	unsigned int bitness,
+	unsigned int dim_x,
+	unsigned int dim_y,
+	unsigned int dim_z
+) {
+	astcenc_image *img = new astcenc_image;
+	img->dim_x = dim_x;
+	img->dim_y = dim_y;
+	img->dim_z = dim_z;
 
-static uint8_t table59T58H[8] = { 3,6,11,16,23,32,41,64 };
+	void** data = new void*[dim_z];
+	img->data = data;
 
-static int8_t matrix_ls[3][16] = {
-    {-6, -6, -6, -6, -2, -2, -2, -2,  2,  2,  2,  2,  6,  6,  6,  6},
-    {-6, -2,  2,  6, -6, -2,  2,  6, -6, -2,  2,  6, -6, -2,  2,  6},
-    {23, 17, 11,  5, 17, 11,  5, -1, 11,  5, -1, -7,  5, -1, -7, -13}
-};
+	if (bitness == 8)
+	{
+		img->data_type = ASTCENC_TYPE_U8;
+		for (unsigned int z = 0; z < dim_z; z++)
+		{
+			data[z] = new uint8_t[dim_x * dim_y * 4];
+		}
+	}
+	else if (bitness == 16)
+	{
+		img->data_type = ASTCENC_TYPE_F16;
+		for (unsigned int z = 0; z < dim_z; z++)
+		{
+			data[z] = new uint16_t[dim_x * dim_y * 4];
+		}
+	}
+	else // if (bitness == 32)
+	{
+		assert(bitness == 32);
+		img->data_type = ASTCENC_TYPE_F32;
+		for (unsigned int z = 0; z < dim_z; z++)
+		{
+			data[z] = new float[dim_x * dim_y * 4];
+		}
+	}
 
+	return img;
+}
+
+
+astcenc_image* astc_img_from_unorm8x4_array(
+	const uint8_t* data,
+	unsigned int dim_x,
+	unsigned int dim_y,
+	bool y_flip
+) {
+	astcenc_image* img = alloc_image(8, dim_x, dim_y, 1);
+
+	for (unsigned int y = 0; y < dim_y; y++)
+	{
+		uint8_t* data8 = static_cast<uint8_t*>(img->data[0]);
+		unsigned int y_src = y_flip ? (dim_y - y - 1) : y;
+		const uint8_t* src = data + 4 * dim_x * y_src;
+
+		for (unsigned int x = 0; x < dim_x; x++)
+		{
+			data8[(4 * dim_x * y) + (4 * x    )] = src[4 * x    ];
+			data8[(4 * dim_x * y) + (4 * x + 1)] = src[4 * x + 1];
+			data8[(4 * dim_x * y) + (4 * x + 2)] = src[4 * x + 2];
+			data8[(4 * dim_x * y) + (4 * x + 3)] = src[4 * x + 3];
+		}
+	}
+
+	return img;
+}
 
 /**
  * @brief Reverse bits in a byte.
@@ -89,34 +153,6 @@ static etcpak_force_inline int32_t expand6(uint32_t value)
 static etcpak_force_inline int32_t expand7(uint32_t value)
 {
     return (value << 1) | (value >> 6);
-}
-
-static void matrix_multiply(int32_t* dst, int32_t* src, int32_t* matrix, 
-                           size_t m, size_t k, size_t n,
-                           size_t ld_dst, size_t ld_src, size_t ld_matrix)
-{
-    // dst[m][n] = src[m][k] * matrix[k][n]
-    for (size_t i = 0; i < m; ++i)
-    {
-        for (size_t k_idx = 0; k_idx < k; ++k_idx)
-        {
-            int32_t src_val = src[i * ld_src + k_idx];
-            for (size_t j = 0; j < n; ++j)
-            {
-                dst[i * ld_dst + j] += src_val * matrix[k_idx * ld_matrix + j];
-            }
-        }
-    }
-}
-
-static float dot_product(float* vec1, float* vec2, int dim)
-{
-    float sum = 0;
-    for (int i = 0; i < dim; ++i)
-    {
-        sum += vec1[i] * vec2[i];
-    }
-    return sum;
 }
 
 static uint8_t clamp6(int32_t x)
@@ -273,27 +309,16 @@ static etcpak_force_inline void single_color(uint8_t *dst)
 
 static etcpak_force_inline void DecodeT( uint64_t block, uint8_t* dst, v2i& weight_block_size, block_size_descriptor& bsd)
 {
-    /*      Store weights       */
-    uint32_t idx = (block >> 48);
+    uint32_t up_idx = block >> 48;
+    uint32_t down_idx = (block >> 32) & 0xFFFF;
 
-    uint8_t weightbuf[16]{0};
-
-    // column major to row major
-    col2row1bit((uint8_t *)&idx, weightbuf, weight_block_size.x, weight_block_size.y);
-
-    for (int i = 0; i < 16; i++)
-    {
-        dst[i] = static_cast<uint8_t>(bitrev8(weightbuf[15 - i]));
-    }
-
-    /*      End       */
-
+    // Modifying from here
     /*      Find Best Partitioning       */
-    // bitmap[0]: c2, c3
-    // bitmap[1]: c0, c1
-    uint64_t bitmap[2];
+    // bitmap[0]: c0
+    // bitmap[1]: c1, c2, c3
+    uint64_t bitmap[2]{ 0 };
 
-    idx = (block >> 32) & 0xFFFF;
+    uint32_t idx = ((~down_idx) & 0xFFFF) & ((~up_idx) & 0xFFFF);
     col2row1bit((uint8_t *)&idx, (uint8_t *)bitmap, weight_block_size.x, weight_block_size.y);
 
     bitmap[1] = (~(bitmap[0])) & 0xFFFF;
@@ -319,13 +344,15 @@ static etcpak_force_inline void DecodeT( uint64_t block, uint8_t* dst, v2i& weig
     int v1 = popcount(bitmap[0] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][0]) + popcount(bitmap[1] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][1]);
 	int v2 = popcount(bitmap[0] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][1]) + popcount(bitmap[1] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][0]);
 
-    // If v1 > v2, then the partition 0 should be c0, c1
-    // If v1 < v2, then the partition 0 should be c2, c3
+    // If v1 > v2, then the partition 0 should be c1, c2, c3
+    // If v1 < v2, then the partition 0 should be c0
     bool ordering_is_reversed = (v1 > v2);
     /*      End       */
 
-    const quant_method color_quant_method = QUANT_96; //4x4 weight block 만 상정
-    uint8_t color_values[2][6]{0};
+    const quant_method color_quant_method = QUANT_128; //4x4 weight block 만 상정
+    const quant_method weight_quant_method = QUANT_3;
+    float weight_quant_levels = static_cast<float>(get_quant_level(weight_quant_method));
+    uint8_t color_values[10]{0};
     const uint8_t *pack_table = color_uquant_to_scrambled_pquant_tables[color_quant_method - QUANT_6];
 
     const auto r0 = ( block >> 24 ) & 0x1B;
@@ -338,13 +365,13 @@ static etcpak_force_inline void DecodeT( uint64_t block, uint8_t* dst, v2i& weig
     const auto g1 = ( block >> 8 ) & 0xF;
     const auto b1 = ( block >> 4 ) & 0xF;
 
-    const auto cr0 = ( ( rh0 << 6 ) | ( rl0 << 4 ) | ( rh0 << 2 ) | rl0);
-    const auto cg0 = ( g0 << 4 ) | g0;
-    const auto cb0 = ( b0 << 4 ) | b0;
+    auto cr0 = ( ( rh0 << 6 ) | ( rl0 << 4 ) | ( rh0 << 2 ) | rl0);
+    auto cg0 = ( g0 << 4 ) | g0;
+    auto cb0 = ( b0 << 4 ) | b0;
 
-    const auto cr1 = ( r1 << 4 ) | r1;
-    const auto cg1 = ( g1 << 4 ) | g1;
-    const auto cb1 = ( b1 << 4 ) | b1;
+    auto cr1 = ( r1 << 4 ) | r1;
+    auto cg1 = ( g1 << 4 ) | g1;
+    auto cb1 = ( b1 << 4 ) | b1;
 
     const auto codeword_hi = ( block >> 2 ) & 0x3;
     const auto codeword_lo = block & 0x1;
@@ -358,37 +385,103 @@ static etcpak_force_inline void DecodeT( uint64_t block, uint8_t* dst, v2i& weig
     const auto c3g = clampu8( cg1 - table59T58H[codeword] );
     const auto c3b = clampu8( cb1 - table59T58H[codeword] );
 
+    unsigned long long v3 = 255;
+    cr0 = (cr0 * 256 + 127) >> 8;
+    cg0 = (cg0 * 256 + 127) >> 8;
+    cb0 = (cb0 * 256 + 127) >> 8;
+
+
+    /*      Store weights       */
+    down_idx = (down_idx | (down_idx << 8)) & 0x00FF00FF;
+    down_idx = (down_idx | (down_idx << 4)) & 0x0F0F0F0F;
+    down_idx = (down_idx | (down_idx << 2)) & 0x33333333;
+    down_idx = (down_idx | (down_idx << 1)) & 0x55555555;
+
+    up_idx = (up_idx | (up_idx << 8)) & 0x00FF00FF;
+    up_idx = (up_idx | (up_idx << 4)) & 0x0F0F0F0F;
+    up_idx = (up_idx | (up_idx << 2)) & 0x33333333;
+    up_idx = (up_idx | (up_idx << 1)) & 0x55555555;
+
+    idx = down_idx | (up_idx << 1);
+
+    // index 0: c3
+    // index 1: c1
+    // index 2: c2
+    // index 3: c0
+    idx = (~idx) & 0xFFFFFFFF;
+    
+    const auto& qat = quant_and_xfer_tables[weight_quant_method];
+
+    uint8_t weightbuf[16]{0};
+    uint8_t weights[16]{0};
+
+
+    for (int i = 0; i < 4; i++)
+    {
+        for (int j = 0; j < 4; j++)
+        {
+            // Weights are stored in column major order
+            uint16_t ind = (idx & 0x3);
+
+            if (ind == 3) {
+                idx >>= 2;
+                continue;
+            }
+            
+            float uqw = static_cast<float>(ind * 32);
+            float qw = (uqw / 64.0f) * (weight_quant_levels - 1.0f);
+			int qwi = static_cast<int>(qw + 0.5f);
+            weights[i + j * 4] = qat.scramble_map[qwi];
+            idx >>= 2;
+        }
+    }
+
+    encode_ise(weight_quant_method, 16, weights, weightbuf, 0);
+
+    // 26 bits
+    for (int i = 0; i < 16; i++)
+    {
+        dst[i] = static_cast<uint8_t>(bitrev8(weightbuf[15 - i]));
+    }
+
+    /*      End       */
+
+    uint8_t color_format1 = 0;
+    uint8_t color_format2 = 0;
+
     if(ordering_is_reversed)
     {
-        color_values[0][0] = pack_table[cr0];
-        color_values[0][1] = pack_table[cr1];
-        color_values[0][2] = pack_table[cg0];
-        color_values[0][3] = pack_table[cg1];
-        color_values[0][4] = pack_table[cb0];
-        color_values[0][5] = pack_table[cb1];
+        color_values[0] = pack_table[c3r];
+        color_values[1] = pack_table[c2r];
+        color_values[2] = pack_table[c3g];
+        color_values[3] = pack_table[c2g];
+        color_values[4] = pack_table[c3b];
+        color_values[5] = pack_table[c2b];
 
-        color_values[1][0] = pack_table[c3r];
-        color_values[1][1] = pack_table[c2r];
-        color_values[1][2] = pack_table[c3g];
-        color_values[1][3] = pack_table[c2g];
-        color_values[1][4] = pack_table[c3b];
-        color_values[1][5] = pack_table[c2b];
+        color_values[6] = pack_table[cr0];
+        color_values[7] = pack_table[cg0];
+        color_values[8] = pack_table[cb0];
+        color_values[9] = pack_table[v3];
+
+        color_format1 = 0x1;
+        color_format2 = 0x4;
     }
     else
     {
-        color_values[0][0] = pack_table[c3r];
-        color_values[0][1] = pack_table[c2r];
-        color_values[0][2] = pack_table[c3g];
-        color_values[0][3] = pack_table[c2g];
-        color_values[0][4] = pack_table[c3b];
-        color_values[0][5] = pack_table[c2b];
+        color_values[0] = pack_table[cr0];
+        color_values[1] = pack_table[cg0];
+        color_values[2] = pack_table[cb0];
+        color_values[3] = pack_table[v3];
+    
+        color_values[4] = pack_table[c3r];
+        color_values[5] = pack_table[c2r];
+        color_values[6] = pack_table[c3g];
+        color_values[7] = pack_table[c2g];
+        color_values[8] = pack_table[c3b];
+        color_values[9] = pack_table[c2b];
 
-        color_values[1][0] = pack_table[cr0];
-        color_values[1][1] = pack_table[cr1];
-        color_values[1][2] = pack_table[cg0];
-        color_values[1][3] = pack_table[cg1];
-        color_values[1][4] = pack_table[cb0];
-        color_values[1][5] = pack_table[cb1];
+        color_format1 = 0x4;
+        color_format2 = 0x1;
     }
 
     // Block mode for
@@ -397,15 +490,17 @@ static etcpak_force_inline void DecodeT( uint64_t block, uint8_t* dst, v2i& weig
     //  Weight block width 4
     //  Weight block height 4
     //  No dual plane
-    const uint16_t block_mode = 0x0042;
-    const uint8_t color_format = 8;                   // RGB direct
+    const uint16_t block_mode = 0x0051;
+    const uint8_t color_format_bits = 0x2 | ((color_format1 & 0x1) << 2) | ((color_format2 & 0x1) << 3) | ((color_format1 & 0x6) << 3);
+    int encoded_type_highpart_pos = 128 - 26 - 2;
 
     write_bits(block_mode, 11, 0, dst);
     write_bits(partition_count - 1, 2, 11, dst);
     write_bits(partition_index, PARTITION_INDEX_BITS, 13, dst);
-    write_bits(color_format << 2, 6, 13 + PARTITION_INDEX_BITS, dst);
+    write_bits(color_format_bits, 6, 13 + PARTITION_INDEX_BITS, dst);
+    write_bits((color_format2 & 0x6) >> 1, 2, encoded_type_highpart_pos, dst);
 
-    encode_ise(color_quant_method, 12, (uint8_t *)color_values, dst,
+    encode_ise(color_quant_method, 10, (uint8_t *)color_values, dst,
                19 + PARTITION_INDEX_BITS);
 }
 
@@ -414,10 +509,21 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
     /*      Store weights       */
     uint32_t idx = (block >> 32) & 0xFFFF;
 
+    // Lower value should be indexed by 0 because of the blue contraction
+    // in decoding process of ASTC
+    idx = (~idx) & 0xFFFF;
+
+    idx = (idx | (idx << 8)) & 0x00FF00FF;
+    idx = (idx | (idx << 4)) & 0x0F0F0F0F;
+    idx = (idx | (idx << 2)) & 0x33333333;
+    idx = (idx | (idx << 1)) & 0x55555555;
+
+    idx = (idx | (idx << 1));
+
     uint8_t weightbuf[16]{0};
 
     // column major to row major
-    col2row1bit((uint8_t *)&idx, weightbuf, weight_block_size.x, weight_block_size.y);
+    col2row2bit((uint8_t *)&idx, weightbuf, weight_block_size.x, weight_block_size.y);
 
     for (int i = 0; i < 16; i++)
     {
@@ -427,8 +533,8 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
     /*      End       */
 
     /*      Find Best Partitioning       */
-    // bitmap[0]: r0, g0, b0
-    // bitmap[1]: r1, g1, b1
+    // bitmap[0]: r1, g1, b1
+    // bitmap[1]: r0, g0, b0
     uint64_t bitmap[2];
 
     idx = (block >> 48);
@@ -457,12 +563,12 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
     int v1 = popcount(bitmap[0] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][0]) + popcount(bitmap[1] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][1]);
 	int v2 = popcount(bitmap[0] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][1]) + popcount(bitmap[1] ^ bsd.coverage_bitmaps_2[partition_ordering[0]][0]);
 
-    // If v1 > v2, then the partition 0 should be r1, g1, b1
-    // If v1 < v2, then the partition 0 should be r0, g0, b0
+    // If v1 > v2, then the partition 0 should be r0, g0, b0
+    // If v1 < v2, then the partition 0 should be r1, g1, b1
     bool ordering_is_reversed = (v1 > v2);
     /*      End       */
 
-    const quant_method color_quant_method = QUANT_96; //4x4 weight block 만 상정
+    const quant_method color_quant_method = QUANT_40; //4x4 weight block 만 상정
     uint8_t color_values[2][6]{0};
     const uint8_t *pack_table = color_uquant_to_scrambled_pquant_tables[color_quant_method - QUANT_6];
 
@@ -490,6 +596,22 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
 
     if(ordering_is_reversed)
     {
+        color_values[0][0] = pack_table[clampu8( r0 - table59T58H[codeword] )];
+        color_values[0][1] = pack_table[clampu8( r0 + table59T58H[codeword] )];
+        color_values[0][2] = pack_table[clampu8( g0 - table59T58H[codeword] )];
+        color_values[0][3] = pack_table[clampu8( g0 + table59T58H[codeword] )];
+        color_values[0][4] = pack_table[clampu8( b0 - table59T58H[codeword] )];
+        color_values[0][5] = pack_table[clampu8( b0 + table59T58H[codeword] )];
+    
+        color_values[1][0] = pack_table[clampu8( r1 - table59T58H[codeword] )];
+        color_values[1][1] = pack_table[clampu8( r1 + table59T58H[codeword] )];
+        color_values[1][2] = pack_table[clampu8( g1 - table59T58H[codeword] )];
+        color_values[1][3] = pack_table[clampu8( g1 + table59T58H[codeword] )];
+        color_values[1][4] = pack_table[clampu8( b1 - table59T58H[codeword] )];
+        color_values[1][5] = pack_table[clampu8( b1 + table59T58H[codeword] )];
+    }
+    else
+    {
         color_values[0][0] = pack_table[clampu8( r1 - table59T58H[codeword] )];
         color_values[0][1] = pack_table[clampu8( r1 + table59T58H[codeword] )];
         color_values[0][2] = pack_table[clampu8( g1 - table59T58H[codeword] )];
@@ -503,22 +625,6 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
         color_values[1][3] = pack_table[clampu8( g0 + table59T58H[codeword] )];
         color_values[1][4] = pack_table[clampu8( b0 - table59T58H[codeword] )];
         color_values[1][5] = pack_table[clampu8( b0 + table59T58H[codeword] )];
-    }
-    else
-    {
-        color_values[0][0] = pack_table[clampu8( r0 - table59T58H[codeword] )];
-        color_values[0][1] = pack_table[clampu8( r0 + table59T58H[codeword] )];
-        color_values[0][2] = pack_table[clampu8( g0 - table59T58H[codeword] )];
-        color_values[0][3] = pack_table[clampu8( g0 + table59T58H[codeword] )];
-        color_values[0][4] = pack_table[clampu8( b0 - table59T58H[codeword] )];
-        color_values[0][5] = pack_table[clampu8( b0 + table59T58H[codeword] )];
-
-        color_values[1][0] = pack_table[clampu8( r1 - table59T58H[codeword] )];
-        color_values[1][1] = pack_table[clampu8( r1 + table59T58H[codeword] )];
-        color_values[1][2] = pack_table[clampu8( g1 - table59T58H[codeword] )];
-        color_values[1][3] = pack_table[clampu8( g1 + table59T58H[codeword] )];
-        color_values[1][4] = pack_table[clampu8( b1 - table59T58H[codeword] )];
-        color_values[1][5] = pack_table[clampu8( b1 + table59T58H[codeword] )];
     }
 
     // Block mode for
@@ -539,132 +645,48 @@ static etcpak_force_inline void DecodeH( uint64_t block, uint8_t* dst, v2i& weig
                19 + PARTITION_INDEX_BITS);
 }
 
-static etcpak_force_inline void DecodePlanar( uint64_t block, uint8_t* dst, v2i& weight_block_size, block_size_descriptor& bsd)
+static etcpak_force_inline void DecodePlanar(
+    uint64_t block, 
+    uint8_t* dst, 
+    int xpos,
+    int ypos,
+    v2i& weight_block_size, 
+    block_size_descriptor& bsd, 
+    astcenc_contexti* ctx,
+    astcenc_image* original_image,
+    int thread_id)
 {
-    const auto bv = expand6((block >> ( 0 + 32)) & 0x3F);
-    const auto gv = expand7((block >> ( 6 + 32)) & 0x7F);
-    const auto rv = expand6((block >> (13 + 32)) & 0x3F);
+    image_block blk;
 
-    const auto bh = expand6((block >> (19 + 32)) & 0x3F);
-    const auto gh = expand7((block >> (25 + 32)) & 0x7F);
+    blk.texel_count = static_cast<uint8_t>(bsd.xdim * bsd.ydim * bsd.zdim);
+    blk.decode_unorm8 = ctx->config.flags & ASTCENC_FLG_USE_DECODE_UNORM8;
+    blk.channel_weight = vfloat4(ctx->config.cw_r_weight,
+        ctx->config.cw_g_weight,
+        ctx->config.cw_b_weight,
+        ctx->config.cw_a_weight);
 
-    const auto rh0 = (block >> (32 - 32)) & 0x01;
-    const auto rh1 = ((block >> (34 - 32)) & 0x1F) << 1;
-    const auto rh = expand6(rh0 | rh1);
+    // swizzle and decode mode are not used
+    astcenc_swizzle swizzle; 
+    astcenc_profile decode_mode = ASTCENC_PRF_LDR;
 
-    const auto bo0 = (block >> (39 - 32)) & 0x07;
-    const auto bo1 = ((block >> (43 - 32)) & 0x3) << 3;
-    const auto bo2 = ((block >> (48 - 32)) & 0x1) << 5;
-    const auto bo = expand6(bo0 | bo1 | bo2);
-    const auto go0 = (block >> (49 - 32)) & 0x3F;
-    const auto go1 = ((block >> (56 - 32)) & 0x01) << 6;
-    const auto go = expand7(go0 | go1);
-    const auto ro = expand6((block >> (57 - 32)) & 0x3F);
+    load_image_block_fast_ldr(decode_mode, *original_image, blk, bsd, xpos * bsd.xdim, ypos * bsd.ydim, 0, swizzle);
 
-    int32_t decoded_colors[16][3]{0};
+    auto& temp_buffers = ctx->working_buffers[thread_id];
 
-
-    for( int j=0; j<4; j++ )
-    {
-        for( int i=0; i<4; i++ )
-        {
-            const uint32_t r = (i * (rh - ro) + j * (rv - ro) + 4 * ro + 2) >> 2;
-            const uint32_t g = (i * (gh - go) + j * (gv - go) + 4 * go + 2) >> 2;
-            const uint32_t b = (i * (bh - bo) + j * (bv - bo) + 4 * bo + 2) >> 2;
-            if( ( ( r | g | b ) & ~0xFF ) == 0 )
-            {
-                decoded_colors[j*4+i][0] = r;
-                decoded_colors[j*4+i][1] = g;
-                decoded_colors[j*4+i][2] = b;
-            }
-            else
-            {
-                const auto rc = clampu8( r );
-                const auto gc = clampu8( g );
-                const auto bc = clampu8( b );
-                decoded_colors[j*4+i][0] = rc;
-                decoded_colors[j*4+i][1] = gc;
-                decoded_colors[j*4+i][2] = bc;
-            }
-        }
-    }
-
-    int32_t abc[3][3]{0};
-    matrix_multiply((int32_t*)abc, (int32_t*)matrix_ls, (int32_t*)decoded_colors, 3, 16, 3, 3, 16, 3);
-
-    float abc_f[3][3]{0};
-    float denom = 1.f / 80.f;
-    for (int i = 0; i < 3; ++i)
-    {
-        for (int j = 0; j < 3; ++j)
-        {
-            abc_f[i][j] = abc[i][j] * denom;
-        }
-    }
-
-    float d[3] = {abc_f[0][0] * 3 + abc_f[1][0] * 3, abc_f[0][1] * 3 + abc_f[1][1] * 3, abc_f[0][2] * 3 + abc_f[1][2] * 3};
-
-    const quant_method color_quant_method = QUANT_256; // (4x4 weight block 만 상정)
-    uint8_t color_values[6]{0};
-    const uint8_t *pack_table = color_uquant_to_scrambled_pquant_tables[color_quant_method - QUANT_6];
-
-    color_values[0] = pack_table[clampu8(abc_f[2][0])];
-    color_values[1] = pack_table[clampu8(d[0] + abc_f[2][0])];
-    color_values[2] = pack_table[clampu8(abc_f[2][1])];
-    color_values[3] = pack_table[clampu8(d[1] + abc_f[2][1])];
-    color_values[4] = pack_table[clampu8(abc_f[2][2])];
-    color_values[5] = pack_table[clampu8(d[2] + abc_f[2][2])];
-
-    denom = 1.f / (dot_product(d, d, 3));
-
-    uint8_t weight_values[16];
-    uint8_t weightbuf[16]{0};
-    quant_method weight_quant_method = QUANT_4;
-    const auto& qat = quant_and_xfer_tables[weight_quant_method];
-    float weight_quant_levels = static_cast<float>(get_quant_level(weight_quant_method));
-
-
-    float tmp[3];
-    for (int i = 0; i < 4; ++i){
-        for (int j = 0; j < 4; ++j){
-            tmp[0] = abc_f[0][0] * i + abc_f[1][0] * j;
-            tmp[1] = abc_f[0][1] * i + abc_f[1][1] * j;
-            tmp[2] = abc_f[0][2] * i + abc_f[1][2] * j;
-
-            float uqw = static_cast<float>(clamp6((uint8_t)(dot_product(tmp, d, 3) * denom)));
-            float qw = (uqw / 64.0f) * (weight_quant_levels - 1.0f);
-			int qwi = static_cast<int>(qw + 0.5f);
-			weight_values[i * 4 + j] = qat.scramble_map[qwi];
-        }
-    }
-
-    encode_ise(weight_quant_method, 16, weight_values, weightbuf, 0);
-
-    for (int i = 0; i < 16; i++)
-	{
-		dst[i] = static_cast<uint8_t>(bitrev8(weightbuf[15 - i]));
-	}
-
-    // Block mode for
-    //  weight range [0, 3]
-    //  Low-precision
-    //  Weight block width 4
-    //  Weight block height 4
-    //  No dual plane
-    const uint16_t block_mode = 0x0042;
-
-    const unsigned int partition_count = 1;
-    const uint8_t color_format = 8;                   // RGB direct
-
-    write_bits(block_mode, 11, 0, dst);
-	write_bits(partition_count - 1, 2, 11, dst);
-
-    write_bits(color_format, 4, 13, dst);
-
-    encode_ise(color_quant_method, 6, (uint8_t *)color_values, dst, 17);
+    compress_block(*ctx, blk, dst, temp_buffers);
 }
 
-static etcpak_force_inline void DecodeRGBPart(uint64_t d, uint8_t *dst, v2i& block_size, v2i& weight_block_size, block_size_descriptor& bsd)
+static etcpak_force_inline void DecodeRGBPart(
+    uint64_t d, 
+    uint8_t *dst, 
+    int xpos,
+    int ypos,
+    v2i& block_size, 
+    v2i& weight_block_size, 
+    block_size_descriptor& bsd, 
+    astcenc_contexti* ctx,
+    astcenc_image* original_image,
+    int thread_id)
 {
     d = ConvertByteOrder(d);
 
@@ -689,24 +711,24 @@ static etcpak_force_inline void DecodeRGBPart(uint64_t d, uint8_t *dst, v2i& blo
         // T mode
         if ((r1 < 0) || (r1 > 31))
         {
-            //DecodeT(d, dst, weight_block_size, bsd);
-            single_color(dst);
+            DecodeT(d, dst, weight_block_size, bsd);
+            //single_color(dst);
             return;
         }
 
         // H mode
         if ((g1 < 0) || (g1 > 31))
         {
-            // DecodeH(d, dst, weight_block_size, bsd);
-            single_color(dst);
+            DecodeH(d, dst, weight_block_size, bsd);
+            //single_color(dst);
             return;
         }
 
         // P mode
         if ((b1 < 0) || (b1 > 31))
         {
-            // DecodePlanar(d, dst, weight_block_size, bsd);
-            single_color(dst);
+            DecodePlanar(d, dst, xpos, ypos, weight_block_size, bsd, ctx, original_image, thread_id);
+            //single_color(dst);
             return;
         }
 
@@ -875,8 +897,18 @@ static etcpak_force_inline void DecodeRGBPart(uint64_t d, uint8_t *dst, v2i& blo
                19 + PARTITION_INDEX_BITS);
 }
 
-static void DecodeRGB(const uint64_t *src, uint8_t *dst, v2i& src_size, v2i& astc_img_size, v2i& block_size, v2i& weight_block_size, float quality)
+static void DecodeRGB(
+    const uint64_t *src, 
+    uint8_t *dst, 
+    v2i& src_size, 
+    v2i& astc_img_size, 
+    v2i& block_size, 
+    v2i& weight_block_size, 
+    float quality, 
+    astcenc_image* original_image)
 {
+    int thread_count = omp_get_max_threads();
+
     // ------------------------------------------------------------------------
 	// Initialize the default configuration for the block size and quality
 	astcenc_config config;
@@ -891,7 +923,7 @@ static void DecodeRGB(const uint64_t *src, uint8_t *dst, v2i& src_size, v2i& ast
 	// ------------------------------------------------------------------------
 	// Create a context based on the configuration
 	astcenc_context* context;
-	status = astcenc_context_alloc(&config, 1, &context);
+	status = astcenc_context_alloc(&config, thread_count, &context);
 	if (status != ASTCENC_SUCCESS)
 	{
 		printf("ERROR: Codec context alloc failed: %s\n", astcenc_get_error_string(status));
@@ -900,21 +932,28 @@ static void DecodeRGB(const uint64_t *src, uint8_t *dst, v2i& src_size, v2i& ast
 
     astcenc_contexti* ctx = &context->context;
 	block_size_descriptor& bsd = *(ctx->bsd);
+
+    /*const astcenc_swizzle swizzle {
+		ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A
+	};
+    astcenc_compress_image(context, original_image, &swizzle, dst, astc_img_size.x * astc_img_size.y * 16, 0);*/
 	// ------------------------------------------------------------------------
 
     const int etc2_block_size_x = src_size.x / 4;
     const int etc2_block_size_y = src_size.y / 4;
     const int total_blocks = etc2_block_size_x * etc2_block_size_y;
 
+    omp_set_num_threads(thread_count);
     #pragma omp parallel for
     for (int block_idx = 0; block_idx < total_blocks; block_idx++)
     {
         int y = block_idx / etc2_block_size_y;
         int x = block_idx % etc2_block_size_y;
-        
+
         uint64_t d = src[block_idx];
         uint8_t *block_dst = dst + (block_idx << 4);
-        DecodeRGBPart(d, block_dst, block_size, weight_block_size, bsd);
+        int thread_id = omp_get_thread_num();
+        DecodeRGBPart(d, block_dst, x, y, block_size, weight_block_size, bsd, ctx, original_image, thread_id);
     }
 
 
@@ -931,23 +970,36 @@ static void DecodeRGB(const uint64_t *src, uint8_t *dst, v2i& src_size, v2i& ast
     astcenc_context_free(context);
 }
 
-void BlockData::transcodeETC2toASTC(uint8_t *astc, float quality)
+void BlockData::transcodeETC2toASTC(uint8_t *astc, float quality, const char* original_path)
 {
     v2i block_size = {4, 4};
     v2i weight_block_size = {4, 4};
-    v2i astc_img_size = {m_size.x / block_size.x, m_size.y / block_size.y};
+    v2i astc_img_size = {(m_size.x + block_size.x - 1) / block_size.x, (m_size.y + block_size.y - 1) / block_size.y};
 
     const uint64_t *src = (const uint64_t *)(m_data + m_dataOffset);
+
+    int image_x, image_y, image_c;
+	uint8_t *image_data = (uint8_t*)stbi_load(original_path, &image_x, &image_y, &image_c, 4);
+
+    astcenc_image image;
+	image.dim_x = image_x;
+	image.dim_y = image_y;
+	image.dim_z = 1;
+	image.data_type = ASTCENC_TYPE_U8;
+	uint8_t* slices = image_data;
+	image.data = reinterpret_cast<void**>(&slices);
 
     switch (m_type)
     {
     case Etc1:
     case Etc2_RGB:
-        ::DecodeRGB(src, astc, m_size, astc_img_size, block_size, weight_block_size, quality);
+        ::DecodeRGB(src, astc, m_size, astc_img_size, block_size, weight_block_size, quality, &image);
         break;
     default:
         assert(false);
     }
+
+    stbi_image_free(image_data);
 }
 
 /* ============================================================================

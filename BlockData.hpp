@@ -41,7 +41,7 @@ public:
     // [out] astc
     // Assuming a 4x4 block for now
     // Assuming texture size is divided by 4
-    void transcodeETC2toASTC(uint8_t* astc, float quality);
+    void transcodeETC2toASTC(uint8_t* astc, float quality, const char* original_path);
 
 private:
     uint8_t* m_data;
