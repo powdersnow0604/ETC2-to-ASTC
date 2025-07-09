@@ -947,8 +947,8 @@ static void DecodeRGB(
     #pragma omp parallel for
     for (int block_idx = 0; block_idx < total_blocks; block_idx++)
     {
-        int y = block_idx / etc2_block_size_y;
-        int x = block_idx % etc2_block_size_y;
+        int y = block_idx / etc2_block_size_x;
+        int x = block_idx % etc2_block_size_x;
 
         uint64_t d = src[block_idx];
         uint8_t *block_dst = dst + (block_idx << 4);
